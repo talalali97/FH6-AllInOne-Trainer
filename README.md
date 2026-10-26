@@ -73,7 +73,7 @@ Get the `.zip` from **[GitHub Releases](../../releases)**, extract, and run `FH6
 ## Known Limitations
 
 - **Don't switch away from the game while playing offline.** When you alt-tab or minimize FH6 and come back, the game's own PlayFab cloud-save protection may shut it down on purpose. This is built into the game — it happens without the trainer too — and it is not a trainer crash. Keep the game in the foreground while playing.
-- **Experimental hooks are disabled** (Gravity, Teleport, Acceleration, and the rest of the ForzaMods-ported set). Time of Day and Mission Timer were re-targeted in v8.7.1 (verified on v440.853: Time of Day yes, Mission Timer not yet). They will return one at a time after a validation round. Skill Score Multiplier and Speed Trap Multiplier are permanently disabled — their signatures match too many code sites to hook safely.
+- **Experimental hooks are disabled** (Gravity, Teleport, Acceleration, and the rest of the ForzaMods-ported set). Time of Day was rewritten in v8.7.1 as plain data writes (no hook) and Mission Timer re-targeted; both still need in-game confirmation on v440.853. They will return one at a time after a validation round. Skill Score Multiplier and Speed Trap Multiplier are permanently disabled — their signatures match too many code sites to hook safely.
 - **Season and Weather depend on game internals** that move between builds. If a build is not recognized the cheat refuses with a clear message instead of guessing — report the message and your game version if you hit it.
 - **Signature-based cheats** (SQL database AOBs, profile hook signatures) may need updating when Forza Horizon 6 patches.
 - **Offline mode only.** Online play will not work and may result in a ban.

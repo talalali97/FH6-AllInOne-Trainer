@@ -338,9 +338,12 @@ internal static class ProfileFeatureCatalog
         // the cave writes the held seconds into [rcx+0x64] before the game advances it, so
         // the clock is pinned every frame no matter which game system last wrote it.
         // Signature = Update's prologue (unique on v440.853; stack frame sizes wildcarded).
+        // NOTE: superseded by TimeOfDayChanger (plain data writes, no hook) — CheatService routes
+        // the feature there; this descriptor is kept for reference and is never installed.
         RuntimeProfileFeature.TimeOfDay => new()
         {
             Key = "TimeOfDay", Name = "Time of Day",
+            BrokenNote = "handled by TimeOfDayChanger (data writes), not by a hook",
             Signature = "48 8B C4 48 89 58 10 44 88 48 20 55 56 57 41 54 41 55 41 56 41 57 48 8D A8 ? ? FF FF 48 81 EC ? ? 00 00",
             MatchOffset = 0, HookSize = 7,
             ExpectedOriginal = [0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x10],

@@ -32,13 +32,24 @@ public partial class App : Application
             // Dispose singletons that own timers/handles so the process actually exits
             // (the 2s game-poll timer otherwise keeps the CLR alive) and so active
             // hooks get restored into the game before we close the process handle.
-            desktop.Exit += (_, _) =>
-            {
-                (Services.GetRequiredService<CheatService>() as IDisposable)?.Dispose();
-                (Services.GetRequiredService<GameProcessService>() as IDisposable)?.Dispose();
-            };
+            // Registered on every exit path we can get: a hook left in the game by a
+            // trainer that went away gets the game killed by its integrity check.
+            desktop.Exit += (_, _) => Cleanup();
+            desktop.MainWindow.Closing += (_, _) => Cleanup();
+            AppDomain.CurrentDomain.ProcessExit += (_, _) => Cleanup();
+            AppDomain.CurrentDomain.UnhandledException += (_, _) => Cleanup();
         }
         base.OnFrameworkInitializationCompleted();
+    }
+
+    private static int _cleanedUp;
+
+    /// <summary>Idempotent: restores game hooks and stops timers. Safe to call from any thread.</summary>
+    public static void Cleanup()
+    {
+        if (System.Threading.Interlocked.Exchange(ref _cleanedUp, 1) == 1) return;
+        try { (Services.GetRequiredService<CheatService>() as IDisposable)?.Dispose(); } catch { }
+        try { (Services.GetRequiredService<GameProcessService>() as IDisposable)?.Dispose(); } catch { }
     }
 
     /// <summary>

@@ -506,7 +506,8 @@ public sealed class RuntimeHookEngine : IDisposable
     private void L(string msg)
     {
         lock (_lock) Log.Add(msg);
-        _onLog?.Invoke(msg);
+        // Logging must never abort a restore (e.g. a UI dispatcher that is already gone at exit).
+        try { _onLog?.Invoke(msg); } catch { }
     }
 
     // ===== Attach =====
@@ -574,9 +575,12 @@ public sealed class RuntimeHookEngine : IDisposable
     public void Detach()
     {
         StopCrcTimer();
-        RestoreCrcPointer();
-
-        RestoreRuntimeProfileHooks();
+        // Hooks first, then the integrity-check pointer: the check must never see a patched
+        // site. A hook left behind here gets the game killed by that check within seconds.
+        try { RestoreRuntimeProfileHooks(); }
+        catch (Exception ex) { try { L($"Hook restore failed: {ex.Message}"); } catch { } }
+        try { RestoreCrcPointer(); }
+        catch (Exception ex) { try { L($"CRC pointer restore failed: {ex.Message}"); } catch { } }
 
         // Reset per-process state — capture flags must not survive a game restart,
         // or the next game process silently skips installation (#195).
@@ -1000,6 +1004,9 @@ public sealed class RuntimeHookEngine : IDisposable
                 catch (Exception ex) { L($"CRC phase-1 (restore) failed: {ex.Message}"); return; }
             }
 
+            // Clean window: hooks restored and the real integrity-check pointer in place.
+            // Per-frame hooks visibly drop out during this second, which is why Time of Day
+            // is implemented as plain data writes instead of a hook (see TimeOfDayChanger).
             Thread.Sleep(1000);
 
             lock (_lock)

@@ -1,9 +1,11 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 using FH6Mod.Cheats.RuntimeHook;
 using FH6Mod.Cheats.Season;
 using FH6Mod.Cheats.Sql;
+using FH6Mod.Cheats.TimeOfDay;
 using FH6Mod.Cheats.Weather;
 using FH6Mod.Cheats.Xp;
 
@@ -16,6 +18,7 @@ public sealed class CheatService : IDisposable
     private readonly RuntimeHookEngine _engine = new();
     private readonly SqlExecutor _sql;
     private readonly SeasonChanger _season;
+    private readonly TimeOfDayChanger _tod;
     private readonly WeatherChanger _weather;
     private readonly XpCaller _xp;
     private readonly RewardCaller _reward;
@@ -35,6 +38,7 @@ public sealed class CheatService : IDisposable
         _log = log;
         _sql = new SqlExecutor(_engine);
         _season = new SeasonChanger(_engine);
+        _tod = new TimeOfDayChanger(_engine);
         _weather = new WeatherChanger(_engine);
         _xp = new XpCaller(_engine);
         _reward = new RewardCaller(_engine);
@@ -42,11 +46,24 @@ public sealed class CheatService : IDisposable
         _game.StatusChanged += OnGameStatusChanged;
     }
 
+    private int _disposed;
+
+    /// <summary>
+    /// Restores every hook and the integrity-check pointer in the game, then releases the
+    /// process handle. Idempotent — called from the Avalonia Exit event, the main window's
+    /// Closing event, AppDomain.ProcessExit and the unhandled-exception handler, because a
+    /// hook left behind by a dead trainer gets the game killed by its integrity check.
+    /// </summary>
     public void Dispose()
     {
-        _game.StatusChanged -= OnGameStatusChanged;
-        _season.Dispose();
-        _engine.Dispose();
+        if (Interlocked.Exchange(ref _disposed, 1) == 1) return;
+        _log.Info("Trainer closing — restoring game hooks");
+        try { _game.StatusChanged -= OnGameStatusChanged; } catch { }
+        try { _tod.Disable(out _); } catch { }
+        try { _season.Dispose(); } catch { }
+        try { _tod.Dispose(); } catch { }
+        try { _engine.Dispose(); } catch (Exception ex) { _log.Error($"Cleanup failed: {ex.Message}"); }
+        _log.Info("Trainer cleanup done");
     }
 
     private void OnGameStatusChanged()
@@ -57,6 +74,7 @@ public sealed class CheatService : IDisposable
             _active.Clear();
             _sql.Reset();
             _season.Reset();
+            _tod.Reset();
             _weather.Reset();
             try { _engine.Detach(); }
             catch (Exception ex) { LastError = $"Detach on game-exit failed: {ex.Message}"; _log.Error($"Detach failed: {ex.Message}"); }
@@ -114,6 +132,7 @@ public sealed class CheatService : IDisposable
             _sql.Reset();
             _reward.Reset();
             _season.Reset();
+            _tod.Reset();
             _weather.Reset();
         }
         _lastAttachedPid = _game.Pid!.Value;
@@ -130,6 +149,16 @@ public sealed class CheatService : IDisposable
         var name = feature.ToString();
         if (!EnsureAttached()) return false;
         _log.Info($"{name}: {(enabled ? "enabling" : "disabling")} @ {value}");
+        if (feature == RuntimeProfileFeature.TimeOfDay)
+        {
+            // Data-driven: value carries the float bits of seconds-of-day.
+            var ok = enabled ? _tod.Enable(BitConverter.Int32BitsToSingle(value), out var terr) : _tod.Disable(out terr);
+            if (!ok) { LastError = terr; _log.Error($"{name} apply: {terr}"); return false; }
+            if (enabled) _active.Add(feature); else _active.Remove(feature);
+            _log.Info($"{name}: {(enabled ? "ENABLED" : "DISABLED")} OK");
+            LastError = null;
+            return true;
+        }
         if (!_engine.ApplyProfile(feature, value, enabled, out var err))
         {
             LastError = err;
@@ -147,6 +176,13 @@ public sealed class CheatService : IDisposable
         var name = feature.ToString();
         _log.Info($"{name}: updating value to {value}");
         if (!EnsureAttached()) return false;
+        if (feature == RuntimeProfileFeature.TimeOfDay)
+        {
+            if (!_tod.Update(BitConverter.Int32BitsToSingle(value), out var terr)) { LastError = terr; _log.Error($"{name} update: {terr}"); return false; }
+            _log.Info($"{name}: value updated OK");
+            LastError = null;
+            return true;
+        }
         if (!_engine.UpdateValue(feature, value, out var err))
         {
             LastError = err;
