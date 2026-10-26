@@ -12,7 +12,7 @@ Current release: **v8.4.0** — download from [GitHub Releases](../../releases).
 |---|---|
 | SQL cheats (cars, upgrades, prices) | works on all game builds tested |
 | Profile hooks (Credits, Wheelspins, Skill Points, Drift, No Skill Break, Freeze AI, Sell Payout) | works on v403.798 and newer builds per user reports |
-| Season switcher | Steam builds; newer builds pending reports after the v8.4.0 site fix |
+| Season switcher | rewritten in v8.7.1 around the game's own ForceVisualSeason path; verified on v440.853 |
 | Weather control | experimental, first release in v8.4.0 |
 | XP Grant | experimental, first release in v8.4.0 |
 | Instant Rewards (wheelspin wallet write) | v403.798 |
@@ -57,7 +57,7 @@ Get the `.zip` from **[GitHub Releases](../../releases)**, extract, and run `FH6
 - **Max All** — max Credits, Wheelspins, Super Wheelspins, Skill Points
 
 ### Season (Unlocks page)
-- Switch Spring / Summer / Autumn / Winter instantly. Click once before loading into the world so the listener is in place, then click again after loading
+- Switch Spring / Summer / Autumn / Winter instantly while driving in free roam (weather, lighting and road surfaces change at once; fast-travel if the scenery still shows the old season). "Natural (revert)" goes back to the schedule, "Hold after fast travel" re-applies your season after track swaps
 
 ### SQL Database (Database page)
 - **Unlock Everything** — all SQL cheats in one click
@@ -73,7 +73,7 @@ Get the `.zip` from **[GitHub Releases](../../releases)**, extract, and run `FH6
 ## Known Limitations
 
 - **Don't switch away from the game while playing offline.** When you alt-tab or minimize FH6 and come back, the game's own PlayFab cloud-save protection may shut it down on purpose. This is built into the game — it happens without the trainer too — and it is not a trainer crash. Keep the game in the foreground while playing.
-- **Experimental hooks are disabled** (Time of Day, Gravity, Teleport, Acceleration, and the rest of the ForzaMods-ported set). They will return one at a time after a validation round. Skill Score Multiplier and Speed Trap Multiplier are permanently disabled — their signatures match too many code sites to hook safely.
+- **Experimental hooks are disabled** (Gravity, Teleport, Acceleration, and the rest of the ForzaMods-ported set). Time of Day and Mission Timer were re-targeted in v8.7.1 (verified on v440.853: Time of Day yes, Mission Timer not yet). They will return one at a time after a validation round. Skill Score Multiplier and Speed Trap Multiplier are permanently disabled — their signatures match too many code sites to hook safely.
 - **Season and Weather depend on game internals** that move between builds. If a build is not recognized the cheat refuses with a clear message instead of guessing — report the message and your game version if you hit it.
 - **Signature-based cheats** (SQL database AOBs, profile hook signatures) may need updating when Forza Horizon 6 patches.
 - **Offline mode only.** Online play will not work and may result in a ban.

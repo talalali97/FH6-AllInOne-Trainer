@@ -234,9 +234,9 @@
                         <TextBlock Grid.Column="0" Text="Speed (x)" VerticalAlignment="Center" FontSize="12" />
                         <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="3" VerticalAlignment="Center">
                             <TextBox Text="{Binding MissionTimerText}" Width="50" VerticalAlignment="Center" />
-                            <Button Classes="ghost-sm" Content="0 (freeze)" Command="{Binding ApplyMissionTimerCommand}" CommandParameter="0" />
-                            <Button Classes="ghost-sm" Content="0.5" Command="{Binding ApplyMissionTimerCommand}" CommandParameter="0.5" />
-                            <Button Classes="ghost-sm" Content="1 (normal)" Command="{Binding ApplyMissionTimerCommand}" CommandParameter="1" />
+                            <Button Classes="ghost-sm" Content="0 (freeze)" Command="{Binding SetMissionTimerCommand}" CommandParameter="0" />
+                            <Button Classes="ghost-sm" Content="0.5" Command="{Binding SetMissionTimerCommand}" CommandParameter="0.5" />
+                            <Button Classes="ghost-sm" Content="1 (normal)" Command="{Binding SetMissionTimerCommand}" CommandParameter="1" />
                             <Button Classes="primary" Content="Set" Padding="8,4" FontSize="10" Command="{Binding ApplyMissionTimerCommand}" />
                         </StackPanel>
                         <ToggleSwitch Grid.Column="2" VerticalAlignment="Center"
@@ -316,7 +316,17 @@
                         </Button>
                     </StackPanel>
 
-                    <TextBlock Classes="dim" Text="Fast-travel or load a race to refresh visuals." />
+                    <Grid ColumnDefinitions="Auto,*,Auto,Auto" ColumnSpacing="10">
+                        <Button Grid.Column="0" Classes="ghost-sm" Content="Natural (revert)" Padding="10,4"
+                                Command="{Binding RevertSeasonCommand}" IsEnabled="{Binding CanToggle}" />
+                        <Button Grid.Column="1" Classes="ghost-sm" Content="Refresh" Padding="10,4" HorizontalAlignment="Left"
+                                Command="{Binding RefreshSeasonStatusCommand}" />
+                        <TextBlock Grid.Column="2" Text="Hold after fast travel" VerticalAlignment="Center" FontSize="12" />
+                        <ToggleSwitch Grid.Column="3" VerticalAlignment="Center"
+                                      IsChecked="{Binding SeasonHold, Mode=TwoWay}" />
+                    </Grid>
+                    <TextBlock Classes="dim" TextWrapping="Wrap"
+                               Text="Uses the game's own ForceVisualSeason path, run on the game thread. Weather, lighting and road surfaces switch immediately; fast-travel if the scenery still shows the old season. Track swaps can drop the override — Hold re-applies it." />
                 </StackPanel>
             </Border>
 

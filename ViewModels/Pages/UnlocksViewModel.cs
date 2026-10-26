@@ -88,7 +88,7 @@ public partial class UnlocksViewModel : PageViewModelBase
         _game.StatusChanged += OnGameStatusChanged;
         _log.Changed += OnLogChanged;
         CanToggle = _game.IsAttached;
-        if (CanToggle) RefreshSeason();
+        if (CanToggle) RefreshSeason(queryGame: false);
     }
 
     private void OnGameStatusChanged()
@@ -105,7 +105,7 @@ public partial class UnlocksViewModel : PageViewModelBase
             }
             else
             {
-                RefreshSeason();
+                RefreshSeason(queryGame: false);
                 RefreshRewards();
             }
         });
@@ -122,9 +122,15 @@ public partial class UnlocksViewModel : PageViewModelBase
     private static int Parse(string s, int fallback)
         => int.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var n) ? n : fallback;
 
-    private static int ParseFloatAsIntBits(string s, float fallback)
+    /// <summary>
+    /// Parses a float and returns its IEEE bit pattern as int (the hook caves store raw
+    /// float bits). <paramref name="allowZero"/> lets 0 through — needed for "freeze the
+    /// mission timer" (0x) and "midnight" (0.0 h); multipliers keep rejecting 0.
+    /// </summary>
+    private static int ParseFloatAsIntBits(string s, float fallback, bool allowZero = false, float max = float.MaxValue)
     {
-        if (!float.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out var f) || f <= 0)
+        if (!float.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out var f)
+            || float.IsNaN(f) || f < 0 || (!allowZero && f == 0) || f > max)
             f = fallback;
         return BitConverter.ToInt32(BitConverter.GetBytes(f), 0);
     }
@@ -137,10 +143,40 @@ public partial class UnlocksViewModel : PageViewModelBase
             : _cheats.LastError);
     }
 
+    /// <summary>
+    /// Pushes a new value into a running hook. If the hook is not enabled yet, enabling it
+    /// with that value is what the user meant — "Set" / preset buttons used to fail with
+    /// "X is not enabled" until the toggle was flipped first, which read as "doesn't work".
+    /// </summary>
     private void ApplyValue(RuntimeProfileFeature f, int value, string nameLabel)
     {
-        var ok = _cheats.UpdateValue(f, value);
-        SetStatus(ok, ok ? $"{nameLabel} updated." : _cheats.LastError);
+        bool ok;
+        if (_cheats.IsActive(f))
+        {
+            ok = _cheats.UpdateValue(f, value);
+            SetStatus(ok, ok ? $"{nameLabel} updated." : _cheats.LastError);
+        }
+        else
+        {
+            ok = _cheats.Apply(f, value, true);
+            SetStatus(ok, ok ? $"{nameLabel} ON." : _cheats.LastError);
+        }
+        RefreshToggleStates();
+    }
+
+    /// <summary>Mirror the engine's active-hook set into the toggle switches.</summary>
+    private void RefreshToggleStates()
+    {
+        IsCreditsOn = _cheats.IsActive(RuntimeProfileFeature.Credits);
+        IsWheelspinsOn = _cheats.IsActive(RuntimeProfileFeature.Wheelspins);
+        IsSuperWheelspinsOn = _cheats.IsActive(RuntimeProfileFeature.SuperWheelspins);
+        IsSkillPointsOn = _cheats.IsActive(RuntimeProfileFeature.SkillPoints);
+        IsSellPayoutOn = _cheats.IsActive(RuntimeProfileFeature.SellFactor);
+        IsDriftMultiOn = _cheats.IsActive(RuntimeProfileFeature.DriftScoreMultiplier);
+        IsNoSkillBreakOn = _cheats.IsActive(RuntimeProfileFeature.NoSkillBreak);
+        IsFreezeAIOn = _cheats.IsActive(RuntimeProfileFeature.FreezeAI);
+        IsTimeOfDayOn = _cheats.IsActive(RuntimeProfileFeature.TimeOfDay);
+        IsMissionTimerOn = _cheats.IsActive(RuntimeProfileFeature.MissionTimerTick);
     }
 
     private void SetStatus(bool ok, string? msg)
@@ -285,25 +321,46 @@ public partial class UnlocksViewModel : PageViewModelBase
     }
 
     // ===== Time of Day =====
+    // The UI takes hours (0.0-24.0; 0 = midnight is valid). The game's clock field is
+    // seconds of day, so the hook receives hours * 3600 as float bits.
+    private int TimeOfDayBits
+    {
+        get
+        {
+            if (!float.TryParse(TimeOfDayText, NumberStyles.Float, CultureInfo.InvariantCulture, out var h)
+                || float.IsNaN(h) || h < 0f || h > 24f)
+                h = 12f;
+            var seconds = (h >= 24f ? 0f : h) * 3600f;
+            return BitConverter.ToInt32(BitConverter.GetBytes(seconds), 0);
+        }
+    }
+
     [RelayCommand] private void ToggleTimeOfDay()
     {
         var on = !_cheats.IsActive(RuntimeProfileFeature.TimeOfDay);
-        Toggle(RuntimeProfileFeature.TimeOfDay, on, ParseFloatAsIntBits(TimeOfDayText, 12f), "Time of Day");
+        Toggle(RuntimeProfileFeature.TimeOfDay, on, TimeOfDayBits, "Time of Day");
         IsTimeOfDayOn = _cheats.IsActive(RuntimeProfileFeature.TimeOfDay);
     }
     [RelayCommand] private void ApplyTimeOfDay()
-        => ApplyValue(RuntimeProfileFeature.TimeOfDay, ParseFloatAsIntBits(TimeOfDayText, 12f), "Time of Day");
-    [RelayCommand] private void SetTimeOfDay(string? a) { if (a is not null) { TimeOfDayText = a; if (IsTimeOfDayOn) ApplyTimeOfDay(); } }
+        => ApplyValue(RuntimeProfileFeature.TimeOfDay, TimeOfDayBits, "Time of Day");
+    // Presets apply immediately (and switch the hook on) — pressing "12" means "make it noon now".
+    [RelayCommand] private void SetTimeOfDay(string? a) { if (a is not null) { TimeOfDayText = a; ApplyTimeOfDay(); } }
 
     // ===== Mission Timer =====
+    // Scale is 0.0 (frozen) .. 10x; 0 is the headline use-case, so allowZero.
+    private int MissionTimerBits => ParseFloatAsIntBits(MissionTimerText, 0f, allowZero: true, max: 10f);
+
     [RelayCommand] private void ToggleMissionTimer()
     {
         var on = !_cheats.IsActive(RuntimeProfileFeature.MissionTimerTick);
-        Toggle(RuntimeProfileFeature.MissionTimerTick, on, ParseFloatAsIntBits(MissionTimerText, 0f), "Mission Timer");
+        Toggle(RuntimeProfileFeature.MissionTimerTick, on, MissionTimerBits, "Mission Timer");
         IsMissionTimerOn = _cheats.IsActive(RuntimeProfileFeature.MissionTimerTick);
     }
     [RelayCommand] private void ApplyMissionTimer()
-        => ApplyValue(RuntimeProfileFeature.MissionTimerTick, ParseFloatAsIntBits(MissionTimerText, 0f), "Mission Timer");
+        => ApplyValue(RuntimeProfileFeature.MissionTimerTick, MissionTimerBits, "Mission Timer");
+    // The preset buttons used to bind to ApplyMissionTimerCommand with a CommandParameter the
+    // parameterless command silently ignored — "0 (freeze)" never changed the value.
+    [RelayCommand] private void SetMissionTimer(string? a) { if (a is not null) { MissionTimerText = a; ApplyMissionTimer(); } }
 
     // ===== Season =====
     [RelayCommand]
@@ -315,33 +372,51 @@ public partial class UnlocksViewModel : PageViewModelBase
     [RelayCommand]
     private void SetSeasonToWinter() { SetSeasonValue(3, "Winter"); }
 
+    [RelayCommand]
+    private void RevertSeason()
+    {
+        var ok = _cheats.RevertSeason(out var err);
+        SetStatus(ok, ok ? "Season back to the game's schedule." : err);
+        RefreshSeason(queryGame: true);
+    }
+
+    // Two-way bound to the "Hold" switch: keep the chosen season across fast travel / reloads.
+    [ObservableProperty] private bool _seasonHold;
+    partial void OnSeasonHoldChanged(bool value) => _cheats.SeasonHold = value;
+
     private void SetSeasonValue(int season, string label)
     {
         var ok = _cheats.SetSeason(season, out var err);
-        SetStatus(ok, ok ? $"Season set to {label}. Fast-travel or load a race to refresh visuals." : err);
-        if (ok) RefreshSeason();
+        SetStatus(ok, ok ? $"Season set to {label}. Weather and lighting switch now; fast-travel if the scenery still shows the old season." : err);
+        RefreshSeason(queryGame: true);
     }
 
-    private void RefreshSeason()
+    /// <summary>
+    /// Updates the season line. <paramref name="queryGame"/> briefly hooks the game to ask
+    /// its season manager; without it (automatic refreshes on attach) nothing is touched.
+    /// </summary>
+    private void RefreshSeason(bool queryGame)
     {
-        var s = _cheats.GetCurrentSeason();
-        if (s is >= 0 and <= 3)
+        var st = _cheats.GetSeasonStatus(queryGame);
+        if (st is null)
         {
-            CurrentSeasonText = SeasonChanger.SeasonName(s);
-            SeasonAvailable = true;
-        }
-        else
-        {
-            CurrentSeasonText = "Not loaded";
+            CurrentSeasonText = queryGame ? "Not loaded (load into the world, then press Refresh)" : "Unknown — press Refresh";
             SeasonAvailable = false;
+            return;
         }
+        SeasonAvailable = st.Ready;
+        CurrentSeasonText = st.Forced
+            ? $"{SeasonChanger.SeasonName(st.EffectiveSeason)} (forced — schedule says {SeasonChanger.SeasonName(st.NaturalSeason)})"
+            : st.Ready ? $"{SeasonChanger.SeasonName(st.NaturalSeason)} (natural)"
+                       : "Not loaded (schedule missing — load into the world)";
     }
 
     [RelayCommand]
     private void RefreshSeasonStatus()
     {
         if (!_game.IsAttached) { CurrentSeasonText = "Not loaded"; SeasonAvailable = false; return; }
-        RefreshSeason();
+        RefreshSeason(queryGame: true);
+        if (!SeasonAvailable) SetStatus(false, _cheats.LastError ?? "Season manager not available yet — drive in free roam, then press Refresh.");
     }
 
     // ===== Weather =====

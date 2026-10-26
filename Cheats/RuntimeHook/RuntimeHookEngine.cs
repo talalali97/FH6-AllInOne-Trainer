@@ -17,11 +17,10 @@ public sealed class RuntimeHookEngine : IDisposable
     private readonly Dictionary<string, RuntimeDetour> _hooks = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<ulong> _hookedAddresses = new();
 
-    // Capture hooks: newer builds contain multiple copies of tiny getter
+    // Weather capture hook: newer builds contain multiple copies of tiny getter
     // functions; we hook ALL matches and use whichever captures a valid entity
-    // at runtime. This avoids the "matched dead code" problem (#197, #199).
-    private readonly List<ulong> _seasonEntityStorageAddrs = new();
-    private bool _seasonHookInstalled;
+    // at runtime. (The season feature no longer uses a capture hook — it talks to
+    // the game's SeasonManager singleton directly, see SeasonChanger.)
     private readonly List<ulong> _weatherEntityStorageAddrs = new();
     private bool _weatherHookInstalled;
 
@@ -156,17 +155,33 @@ public sealed class RuntimeHookEngine : IDisposable
     public bool   IsExecutableAddressPublic(ulong addr) => IsExecutableAddress(addr);
 
     /// <summary>
-    /// Returns the first captured season entity pointer from any of the hooked
-    /// getter copies that has been called by the game.
+    /// Writes the game's main module exactly as it sits in memory to <paramref name="path"/>
+    /// (plus a sidecar .txt with base/size/pid). The shipped exe is partially encrypted on
+    /// disk and decrypted at load, so this is the only image worth analysing when a new
+    /// game build breaks a signature. Read-only with respect to the game.
     /// </summary>
-    public ulong? GetCapturedSeasonEntity()
+    public void DumpMainModule(string path)
     {
-        foreach (var storage in _seasonEntityStorageAddrs)
+        if (!IsAttached || _mainBase == 0 || _mainSize <= 0)
+            throw new InvalidOperationException("Not attached.");
+        const int chunk = 1 << 20;
+        using var fs = new System.IO.FileStream(path, System.IO.FileMode.Create, System.IO.FileAccess.Write);
+        var zeroPage = new byte[4096];
+        for (var off = 0; off < _mainSize; off += chunk)
         {
-            var ptr = ReadUInt64(storage);
-            if (ptr != 0) return ptr;
+            var n = Math.Min(chunk, _mainSize - off);
+            var b = ReadBytes(_mainBase + (ulong)off, n);
+            if (b.Length == n) { fs.Write(b, 0, n); continue; }
+            // A single unreadable page must not blank a whole chunk — fall back to pages.
+            for (var p = 0; p < n; p += 4096)
+            {
+                var pn = Math.Min(4096, n - p);
+                var pb = ReadBytes(_mainBase + (ulong)(off + p), pn);
+                fs.Write(pb.Length == pn ? pb : zeroPage, 0, pn);
+            }
         }
-        return null;
+        System.IO.File.WriteAllText(path + ".txt", $"base=0x{_mainBase:X} size={_mainSize} pid={Pid}\n");
+        L($"Module dumped to {path} ({_mainSize} bytes)");
     }
 
     /// <summary>
@@ -183,31 +198,116 @@ public sealed class RuntimeHookEngine : IDisposable
         return null;
     }
 
+    /// <summary>Whole main module as it sits in memory (decrypted). ~180 MB, so cache per use.</summary>
+    public byte[] ReadModuleBytesPublic() => IsAttached ? ReadBytes(_mainBase, _mainSize) : [];
+
+    public bool IsInModule(ulong addr) => _mainBase != 0 && addr >= _mainBase && addr < _mainBase + (ulong)_mainSize;
+
+    public bool HasDetour(string name) { lock (_lock) return _hooks.ContainsKey(name); }
+
     /// <summary>
-    /// Explicitly installs the season entity capture hook. Called only when the user
-    /// invokes a Season feature — never as a side effect of enabling profile cheats
-    /// (that coupling crashed the MS Store build, see #184).
+    /// Installs a JMP detour at <paramref name="hookAddr"/> to a cave whose code the caller
+    /// builds (the builder receives the cave address; it must re-emit the overwritten
+    /// original instructions and the jump back itself). The detour is registered like any
+    /// other hook, so the CRC bypass timer keeps it alive and Detach restores the site.
+    /// Returns the cave address.
     /// </summary>
-    public bool EnsureSeasonHook(out string? error)
+    public ulong InstallCustomDetour(string name, ulong hookAddr, int hookSize, int caveSize, Func<ulong, byte[]> buildCave)
     {
-        error = null;
-        if (_seasonHookInstalled) return true;
-        if (!IsAttached) { error = "Not attached."; return false; }
-        try { EnsureCrcBypass(); }
-        catch (Exception ex) { error = $"CRC bypass: {ex.Message}"; return false; }
+        if (hookSize < 5) throw new ArgumentException("hookSize must be >= 5");
+        lock (_lock)
+        {
+            if (_hooks.TryGetValue(name, out var existing)) return existing.DetourAddress;
+            if (!IsAttached) throw new InvalidOperationException("Not attached.");
+            EnsureCrcBypass();
+
+            var original = ReadBytes(hookAddr, hookSize);
+            if (original.Length != hookSize)
+                throw new InvalidOperationException($"{name}: could not read hook site 0x{hookAddr:X}.");
+            if (original[0] == 0xE9)
+                throw new InvalidOperationException($"{name}: hook site 0x{hookAddr:X} is already patched by another tool. Close other trainers and retry.");
+
+            var caveAddr = AllocateNear(hookAddr, caveSize);
+            var cave = buildCave(caveAddr);
+            if (cave.Length > Math.Max(caveSize, 4096))
+                throw new InvalidOperationException($"{name}: cave code ({cave.Length} B) exceeds its allocation.");
+            WriteBytes(caveAddr, cave);
+
+            var patch = BuildRelativeJump(hookAddr, caveAddr, hookSize);
+            WriteProtectedBytes(hookAddr, patch);
+
+            _hooks[name] = new RuntimeDetour
+            {
+                Name = name,
+                Address = hookAddr,
+                DetourAddress = caveAddr,
+                Size = caveSize,
+                Original = original,
+                Patch = patch,
+            };
+            _hookedAddresses.Add(hookAddr);
+            L($"{name} detour installed. target=0x{hookAddr:X}, cave=0x{caveAddr:X}, {cave.Length}B");
+            return caveAddr;
+        }
+    }
+
+    /// <summary>
+    /// Removes a detour installed with <see cref="InstallCustomDetour"/>: restores the
+    /// original bytes first (no new entries into the cave), waits a few frames so a game
+    /// thread that is still inside the cave can leave it, then frees the cave.
+    /// </summary>
+    public void RemoveDetour(string name)
+    {
+        RuntimeDetour? det;
+        lock (_lock)
+        {
+            if (!_hooks.TryGetValue(name, out det)) return;
+            _hooks.Remove(name);
+            _hookedAddresses.Remove(det.Address);
+            if (_handle == IntPtr.Zero || _process is not { HasExited: false }) return;
+            try { WriteProtectedBytes(det.Address, det.Original); }
+            catch (Exception ex) { L($"{name}: could not restore hook site: {ex.Message}"); return; }
+        }
+        Thread.Sleep(80);
+        try { Native.VirtualFreeEx(_handle, new IntPtr((long)det.DetourAddress), UIntPtr.Zero, Native.MEM_RELEASE); }
+        catch { /* leak the page rather than risk the game */ }
+        L($"{name} detour removed.");
+    }
+
+    /// <summary>
+    /// Start of the function containing <paramref name="addr"/>, from the module's
+    /// exception directory (.pdata RUNTIME_FUNCTION table). 0 when not covered.
+    /// Lets signature code verify that a match is a real function entry.
+    /// </summary>
+    public ulong FindFunctionStart(ulong addr)
+    {
         try
         {
-            var bytes = ReadBytes(_mainBase, _mainSize);
-            if (bytes.Length == 0) { error = "Could not read main module."; return false; }
-            InstallSeasonHook(bytes);
-            if (!_seasonHookInstalled) { error = "Season hook site not found in this build."; return false; }
-            return true;
+            var dos = ReadBytes(_mainBase, 0x40);
+            if (dos.Length < 0x40 || dos[0] != (byte)'M' || dos[1] != (byte)'Z') return 0;
+            var eLfanew = BitConverter.ToInt32(dos, 0x3C);
+            var nt = ReadBytes(_mainBase + (ulong)eLfanew, 0x200);
+            if (nt.Length < 0x200 || BitConverter.ToUInt32(nt, 0) != 0x4550) return 0;      // "PE\0\0"
+            if (BitConverter.ToUInt16(nt, 24) != 0x20B) return 0;                              // PE32+
+            const int dirException = 3;
+            var excRva = BitConverter.ToUInt32(nt, 24 + 112 + dirException * 8);
+            var excSize = BitConverter.ToUInt32(nt, 24 + 112 + dirException * 8 + 4);
+            if (excRva == 0 || excSize < 12) return 0;
+            var table = ReadBytes(_mainBase + excRva, (int)excSize);
+            var rva = (uint)(addr - _mainBase);
+            int lo = 0, hi = table.Length / 12 - 1;
+            while (lo <= hi)
+            {
+                var mid = (lo + hi) / 2;
+                var begin = BitConverter.ToUInt32(table, mid * 12);
+                var end = BitConverter.ToUInt32(table, mid * 12 + 4);
+                if (rva < begin) hi = mid - 1;
+                else if (rva >= end) lo = mid + 1;
+                else return _mainBase + begin;
+            }
         }
-        catch (Exception ex)
-        {
-            error = $"Season hook install failed: {ex.Message}";
-            return false;
-        }
+        catch { /* fall through */ }
+        return 0;
     }
     /// <summary>
     /// Returns the captured XP progression owner (RCX at AddTotalXP), or null.
@@ -478,11 +578,8 @@ public sealed class RuntimeHookEngine : IDisposable
 
         RestoreRuntimeProfileHooks();
 
-        // Reset per-process state — the season hook flag must not survive a game
-        // restart, or EnsureSeasonHook silently skips installation in the next
-        // game process and the entity is never captured (#195).
-        _seasonHookInstalled = false;
-        _seasonEntityStorageAddrs.Clear();
+        // Reset per-process state — capture flags must not survive a game restart,
+        // or the next game process silently skips installation (#195).
         _weatherHookInstalled = false;
         _weatherEntityStorageAddrs.Clear();
         _xpHookInstalled = false;
@@ -934,77 +1031,6 @@ public sealed class RuntimeHookEngine : IDisposable
         try { WriteUInt64(_crcFunctionPointerAddress, _crcOriginalPointer); }
         catch (Exception ex) { L($"CRC pointer restore failed: {ex.Message}"); }
         _crcBypassActive = false;
-    }
-
-    /// <summary>
-    /// Installs a code cave hook at the "SeasonSettings Loaded" string reference
-    /// to capture the season entity pointer. Used by SeasonChanger.
-    /// </summary>
-    private void InstallSeasonHook(byte[] moduleBytes)
-    {
-        if (_seasonHookInstalled) return;
-
-        // The season getter: movss xmm0,[rcx+0x174]; ret (9 bytes).
-        // Newer builds contain multiple copies (parallel classes, compiler
-        // artifacts). Hook ALL of them — the one the game actually calls
-        // fills its storage slot; dead copies stay zero. (#197, #199)
-        var sig = new byte[] { 0xF3, 0x0F, 0x10, 0x81, 0x74, 0x01, 0x00, 0x00, 0xC3 };
-        var matches = new List<int>();
-        for (int i = 0x1000; i + sig.Length < moduleBytes.Length; i++)
-        {
-            bool ok = true;
-            for (int j = 0; j < sig.Length; j++)
-                if (moduleBytes[i + j] != sig[j]) { ok = false; break; }
-            if (ok) matches.Add(i);
-        }
-        if (matches.Count == 0)
-        {
-            L("Season: no getter matches found in this build.");
-            return;
-        }
-
-        L($"Season: found {matches.Count} getter cop{(matches.Count == 1 ? "y" : "ies")}, hooking all");
-
-        const int caveSize = 0x20;
-        const int storageOffset = 0x10;
-        for (int idx = 0; idx < matches.Count && idx < 4; idx++)
-        {
-            var hookAddr = _mainBase + (ulong)matches[idx];
-
-            // Cave: save RCX (the season entity), re-execute the movss, ret.
-            var caveAddr = AllocateNear(hookAddr, caveSize);
-            var storageAddr = caveAddr + storageOffset;
-            _seasonEntityStorageAddrs.Add(storageAddr);
-
-            var cave = new byte[caveSize];
-            cave[0] = 0x48; cave[1] = 0x89; cave[2] = 0x0D; // MOV [rip+disp32],RCX
-            BitConverter.GetBytes(storageOffset - 7).CopyTo(cave, 3);
-            // re-execute: movss xmm0,[rcx+0x174]
-            cave[7] = 0xF3; cave[8] = 0x0F; cave[9] = 0x10; cave[10] = 0x81;
-            cave[11] = 0x74; cave[12] = 0x01; cave[13] = 0x00; cave[14] = 0x00;
-            // ret
-            cave[15] = 0xC3;
-
-            WriteBytes(caveAddr, cave);
-
-            var hookPatch = BuildRelativeJump(hookAddr, caveAddr, 9);
-            var original = ReadBytes(hookAddr, 9);
-            WriteProtectedBytes(hookAddr, hookPatch);
-
-            _hooks[$"SeasonCapture{idx}"] = new RuntimeDetour
-            {
-                Name = $"SeasonCapture{idx}",
-                Address = hookAddr,
-                DetourAddress = caveAddr,
-                Size = caveSize,
-                Original = original,
-                Patch = hookPatch,
-            };
-
-            L($"Season hook [{idx}] installed @ 0x{hookAddr:X}, storage=0x{storageAddr:X}");
-        }
-
-        _seasonHookInstalled = true;
     }
 
     // ===== low-level read/write/alloc =====

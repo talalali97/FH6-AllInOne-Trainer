@@ -325,60 +325,90 @@ internal static class ProfileFeatureCatalog
             OriginalRegions = [(15, 0, 8)],
         },
 
-        // Time of Day: override time float at rbx+8
-        // Original: F2 0F 11 43 08  (movsd [rbx+8],xmm0)
-        // Time of Day: hold the in-game clock hour (0-24 float).
-        // The clock function accumulates the hour and wraps it modulo 24
-        // (mulss/comiss/jbe + addss -24/ja loop), then stores it at [rbx+0x64].
-        // Signature anchors on that wraparound sequence — verified unique on
-        // v379/v382/v403. The cave replaces xmm6 with the held hour before the store.
+        // Time of Day: hold the in-game clock.
+        //
+        // v440.853 RE (memory dump): the clock object ("TimeOfDay", ctor references
+        // "TimeOfDay_Brio") keeps the current time as SECONDS of day (0..86400, float) at
+        // [this+0x64]. It is advanced once per frame by TimeOfDay::Update(this, float dt,
+        // out*, bool): new = [+0x64] + [+0x6C](speed) * dt, wrapped against 86400, unless
+        // [+0x78] (time stopped) or the global pause check says otherwise. The old hook site
+        // (the "wrap modulo 24" sequence) was TimeOfDay::SyncToRealTime — only reachable
+        // from a debug console command, so it never ran during play, and its cave had the
+        // toggle byte overlapping its own jne. We hook Update's entry instead: when enabled
+        // the cave writes the held seconds into [rcx+0x64] before the game advances it, so
+        // the clock is pinned every frame no matter which game system last wrote it.
+        // Signature = Update's prologue (unique on v440.853; stack frame sizes wildcarded).
         RuntimeProfileFeature.TimeOfDay => new()
         {
             Key = "TimeOfDay", Name = "Time of Day",
-            Signature = "F3 0F 59 F7 0F 2F F0 76 ? F3 0F 10 0D ? ? ? ? F3 0F 58 F1 0F 2F F0 77 ? 0F 28 7C 24 ? F3 0F 11 73 64",
-            MatchOffset = 31, HookSize = 5,
-            ExpectedOriginal = [0xF3, 0x0F, 0x11, 0x73, 0x64],
-            ToggleOffset = 7, ValueOffset = 22,
+            Signature = "48 8B C4 48 89 58 10 44 88 48 20 55 56 57 41 54 41 55 41 56 41 57 48 8D A8 ? ? FF FF 48 81 EC ? ? 00 00",
+            MatchOffset = 0, HookSize = 7,
+            ExpectedOriginal = [0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x10],
+            // Cave layout: Asm (29 B) | jmp back (29..33) | toggle (34) | seconds float (36..39)
+            ToggleOffset = 34, ValueOffset = 36,
             Asm =
             [
-                // cmp byte [rip+0],1 → toggle at Asm+7
-                0x80, 0x3D, 0x00, 0x00, 0x00, 0x00, 0x01,
-                // jne +8 → skip the hour load, fall through to the original store
-                0x75, 0x08,
-                // movss xmm6,[rip+5] → hour float at Asm+22
-                0xF3, 0x0F, 0x10, 0x35, 0x05, 0x00, 0x00, 0x00,
-                // movss [rbx+0x64],xmm6 (original)
-                0xF3, 0x0F, 0x11, 0x73, 0x64,
+                // 0: cmp byte [rip+27],1 → toggle at 34
+                0x80, 0x3D, 0x1B, 0x00, 0x00, 0x00, 0x01,
+                // 7: jne +13 → original prologue at 22
+                0x75, 0x0D,
+                // 9: movss xmm0,[rip+19] → held seconds at 36 (xmm0 is volatile and not an input here)
+                0xF3, 0x0F, 0x10, 0x05, 0x13, 0x00, 0x00, 0x00,
+                // 17: movss [rcx+0x64],xmm0   (rcx = this at function entry)
+                0xF3, 0x0F, 0x11, 0x41, 0x64,
+                // 22: mov rax,rsp ; mov [rax+0x10],rbx  (original 7 bytes)
+                0x48, 0x8B, 0xC4,
+                0x48, 0x89, 0x58, 0x10,
             ],
-            OriginalRegions = [(17, 0, 5)],
+            OriginalRegions = [(22, 0, 7)],
         },
 
-        // Mission Timer: scale the mission countdown tick.
-        // The timer object's remaining time lives at +0x88 (float); the tick function
-        // adds the frame delta to it only while the progress window (+0x48C < +0x490)
-        // is open, then checks remaining > 0 for the fail condition. The cave multiplies
-        // the delta by the user's scale before the store: 0 freezes, 0.5 slows, 2 speeds up.
-        // Signature anchors on the movss/comiss/addss/movss/comiss sequence — verified
-        // unique on v379/v382/v403.
+        // Mission Timer: scale the challenge countdown tick.
+        //
+        // v440.853 RE (memory dump): the old signature matched the Speed Zone PR-stunt
+        // Update ([this+0x88] = elapsed time inside the zone) — scaling it only changed the
+        // zone's average-speed result, never a countdown — and its cave had the same
+        // toggle-over-jne bug as Time of Day. The real per-frame countdown is in the timed
+        // challenge/objective base Update(this, float dt): [this+0x44C] -= dt (xmm7 = dt,
+        // xmm6 = 0.0 for the comparison), clamped to 0, then vtbl[0x1D8] fires "timer ended".
+        // The cave scales dt by the user's factor for that subtraction only (xmm7 is saved
+        // and restored so the rest of the function still sees the real dt): 0 freezes the
+        // timer, 0.5 halves its speed, 2 doubles it.
+        // Signature = load / subss xmm0,xmm7 / store / comiss xmm0,xmm6 / ja / clear-to-zero
+        // (field displacements wildcarded; unique on v440.853).
         RuntimeProfileFeature.MissionTimerTick => new()
         {
             Key = "MissionTimerTick", Name = "Mission Timer",
-            Signature = "F3 0F 10 83 8C 04 00 00 0F 2F 83 90 04 00 00 73 ? F3 0F 58 B3 88 00 00 00 F3 0F 11 B3 88 00 00 00 0F 2F BB 88 00 00 00",
-            MatchOffset = 17, HookSize = 8,
-            ExpectedOriginal = [0xF3, 0x0F, 0x58, 0xB3, 0x88, 0x00, 0x00, 0x00],
-            ToggleOffset = 7, ValueOffset = 22,
+            Signature = "F3 0F 10 83 ? ? 00 00 F3 0F 5C C7 F3 0F 11 83 ? ? 00 00 0F 2F C6 0F 87 ? ? ? ? C7 83 ? ? 00 00 00 00 00 00",
+            MatchOffset = 0, HookSize = 12,
+            // Accept any [rbx+disp32] load + subss xmm0,xmm7; the real displacement is copied in.
+            ExpectedOriginal = [0xF3, 0x0F, 0x10, 0x83],
+            // Cave layout: Asm (59 B) | jmp back (59..63) | toggle (64) | saved dt (68) | scale (72..75)
+            ToggleOffset = 64, ValueOffset = 72,
             Asm =
             [
-                // cmp byte [rip+0],1 → toggle at Asm+7
-                0x80, 0x3D, 0x00, 0x00, 0x00, 0x00, 0x01,
-                // jne +9 → skip the scale multiply, do the original add
-                0x75, 0x09,
-                // mulss xmm6,[rip+1] → scale float at Asm+20
-                0xF3, 0x0F, 0x59, 0x35, 0x01, 0x00, 0x00, 0x00,
-                // addss xmm6,[rbx+0x88] (original, 8 bytes)
-                0xF3, 0x0F, 0x58, 0xB3, 0x88, 0x00, 0x00, 0x00,
+                // 0: cmp byte [rip+57],1 → toggle at 64
+                0x80, 0x3D, 0x39, 0x00, 0x00, 0x00, 0x01,
+                // 7: jne +38 → original path at 47
+                0x75, 0x26,
+                // 9: movss [rip+51],xmm7 → save dt at 68
+                0xF3, 0x0F, 0x11, 0x3D, 0x33, 0x00, 0x00, 0x00,
+                // 17: mulss xmm7,[rip+47] → scale at 72
+                0xF3, 0x0F, 0x59, 0x3D, 0x2F, 0x00, 0x00, 0x00,
+                // 25: movss xmm0,[rbx+disp32]  (copy of original load)
+                0xF3, 0x0F, 0x10, 0x83, 0x4C, 0x04, 0x00, 0x00,
+                // 33: subss xmm0,xmm7 (scaled dt)
+                0xF3, 0x0F, 0x5C, 0xC7,
+                // 37: movss xmm7,[rip+23] → restore dt from 68
+                0xF3, 0x0F, 0x10, 0x3D, 0x17, 0x00, 0x00, 0x00,
+                // 45: jmp +12 → 59 (jmp back)
+                0xEB, 0x0C,
+                // 47: movss xmm0,[rbx+disp32]  (original, 8 bytes)
+                0xF3, 0x0F, 0x10, 0x83, 0x4C, 0x04, 0x00, 0x00,
+                // 55: subss xmm0,xmm7           (original, 4 bytes)
+                0xF3, 0x0F, 0x5C, 0xC7,
             ],
-            OriginalRegions = [(17, 0, 8)],
+            OriginalRegions = [(25, 0, 8), (47, 0, 8), (55, 8, 4)],
         },
 
         // Skill Score Multiplier: imul earned skill score by multiplier

@@ -134,6 +134,28 @@ public partial class SettingsViewModel : PageViewModelBase
         });
     }
 
+    // === Module dump (for signature work on new game builds) ===
+
+    [ObservableProperty] private string _dumpStatus = "";
+    [ObservableProperty] private bool _isDumping;
+
+    [RelayCommand]
+    private void DumpModule()
+    {
+        if (_cheat is null) { DumpStatus = "Service not available."; return; }
+        IsDumping = true;
+        DumpStatus = "Dumping the game module (about 180 MB)...";
+        System.Threading.Tasks.Task.Run(() =>
+        {
+            var path = _cheat.DumpGameModule(out var err);
+            return path is null ? $"Dump failed: {err}" : $"Dumped to {path}";
+        }).ContinueWith(t =>
+        {
+            IsDumping = false;
+            DumpStatus = t.IsFaulted ? $"Error: {t.Exception?.InnerException?.Message}" : t.Result;
+        });
+    }
+
     // === Conflict Detection ===
 
     [RelayCommand]
