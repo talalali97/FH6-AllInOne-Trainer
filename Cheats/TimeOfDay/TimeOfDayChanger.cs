@@ -5,31 +5,54 @@ using FH6Mod.Cheats.RuntimeHook;
 namespace FH6Mod.Cheats.TimeOfDay;
 
 /// <summary>
-/// Holds the in-game clock at a fixed time WITHOUT patching any code.
+/// Holds the in-game clock at a fixed time with data writes only (no code patch).
 ///
-/// Reverse-engineered on v6.440.853.0 (memory dump): the world's TimeOfDay object keeps the
-/// current time as seconds-of-day (float, 0..86400) at +0x64, the clock speed at +0x6C, a
-/// "stopped" byte at +0x78 (TimeOfDay::Update skips the per-frame advance while it is set)
-/// and a "locked" byte at +0x7A (SetTime, ApplyPreset, LoadState and Update's time-source
-/// provider all refuse to write the time while it is set). So the whole cheat is three
-/// data writes: time, stopped=1, locked=1 — re-asserted a few times per second and undone
-/// on disable. No hook means nothing for the integrity check to find and nothing that can
-/// be left behind if the trainer dies.
+/// How the clock really works on v6.440.853.0 (decrypted dump + live trace + adversarially
+/// verified static analysis):
+///   * The world's TimeOfDay object T keeps the time as seconds-of-day (float 0..86400) at +0x64.
+///     Every frame ForzaSimulation::UpdateWeatherAndTimeOfDayManagers runs TimeOfDay::Update
+///     (which copies +0x64 into the lighting/sky packet) and THEN the weather manager WM.
+///   * In free roam WM plays a weather script (the forecast timeline). Its player TL
+///     interpolates a keyframe track driven by the real calendar and writes the result into
+///     T+0x64 every frame (helper "mov eax,[rdx+4]; mov [rcx+0x64],eax"), ignoring T's
+///     "stopped"/"locked" flags. Any value written into T from outside is replaced one frame
+///     later — which is exactly the flicker earlier versions produced. (Re-pointing the
+///     player's clock pointer does not help: the world re-points it at T every frame.)
+///   * The game has its own pause for that timeline, used by its console/script time commands
+///     right before they apply a time: if byte [WM+allow] != 0 then byte [TL+0] = 1. While
+///     paused the timeline stops writing T, TimeOfDay::Update keeps its own advance off, and
+///     nothing else writes T+0x64 per frame — so a single write holds. The weather schedule
+///     is frozen with it.
+///   * Safety: when [WM+allow] == 0 the game never pauses, and a paused timeline in that state
+///     makes the weather manager tear the script down permanently. So we refuse in that case.
+///   * Release: restore the pause byte; the next frame re-derives the time from the calendar.
+///   * If the trainer dies while holding, the timeline just stays paused (the game's normal
+///     paused state) until the game resumes it itself, e.g. on the next world load.
 ///
-/// The object is reached the same way the game's own debug "timeofday" command reaches it:
-/// [global] -> +0x1D0 -> +0x128 -> +0x388. The global and the three link offsets are read
-/// from that command handler and its two accessor functions at runtime, so a layout change
-/// on a new build is detected instead of guessed.
+/// T is reached the way the game's debug "timeofday" command does: [global] -> +0x1D0 ->
+/// +0x128 -> +0x388. The weather-manager global and its offsets are parsed from the game's
+/// own code at runtime and cross-checked between two functions.
 /// </summary>
 public sealed class TimeOfDayChanger : IDisposable
 {
     // TimeOfDay object fields (v440.853; range-validated before use)
-    private const int OffTime = 0x64, OffSpeed = 0x6C, OffStopped = 0x78, OffLocked = 0x7A;
+    private const int OffPrevTime = 0x60, OffTime = 0x64, OffSpeed = 0x6C, OffStopped = 0x78, OffLocked = 0x7A,
+                      OffSpeedFlag = 0x7B, OffTransition = 0x7D;
+    private const int OffTimelineKeys = 0x28;   // TL+0x28: keyframe stream (0 = no script loaded)
 
     // Debug command handler: test al,al ; jne ; xor edx,edx ; mov rcx,[world-root global] ;
     // call GetWorld ; mov rcx,rax ; call GetTimeOfDay ; mov rcx,rax ; call SyncToRealTime
     private const string SigChain = "84 C0 0F 85 ? ? ? ? 33 D2 48 8B 0D ? ? ? ? E8 ? ? ? ? 48 8B C8 E8 ? ? ? ? 48 8B C8 E8 ? ? ? ?";
     private const int ChainGlobalDisp = 13, ChainCallGetWorld = 18, ChainCallGetTod = 26;
+
+    // "Weather script drives time" check: push rbx ; sub rsp,20 ; mov rbx,[WM global] ; ... ;
+    // cmp dword [rbx+modeOff],1 ; jne ; cmp qword [rbx+playerOff],0 ; je
+    private const string SigScriptMode = "40 53 48 83 EC 20 48 8B 1D ? ? ? ? 48 85 DB 74 ? 48 8B CB E8 ? ? ? ? 84 C0 75 ? 83 BB ? ? ? ? 01 75 ? 48 83 BB ? ? ? ? 00 74";
+    private const int ModeGlobalDisp = 9, ModeModeOff = 0x20, ModePlayerOff = 0x2A;
+
+    // The game's own timeline pause: cmp byte [rcx+allowOff],0 ; je ; mov rax,[rcx+playerOff] ; mov byte [rax],1 ; ret
+    private const string SigPause = "80 B9 ? ? ? ? 00 74 0A 48 8B 81 ? ? ? ? C6 00 01 C3";
+    private const int PauseAllowOff = 2, PausePlayerOff = 12;
 
     private readonly RuntimeHookEngine _engine;
     private readonly object _lock = new();
@@ -39,17 +62,22 @@ public sealed class TimeOfDayChanger : IDisposable
     private bool _resolved;
     private ulong _global;
     private int _off1, _off2, _off3;
+    private ulong _wmGlobal;
+    private int _offMode, _offPlayer, _offAllow;
 
     private bool _enabled;
     private float _heldSeconds;
-    private ulong _lastObject;
-    private byte _savedStopped = 0xFF, _savedLocked = 0xFF;
+    private ulong _pausedPlayer;     // TL we paused (0 = none)
+    private byte _savedPause = 0xFF;
+    private ulong _heldObject;       // T we are holding
+    private byte _savedStopped = 0xFF;  // only used in the no-timeline fallback
     private bool _warned;
+    private DateTime _lastLogUtc = DateTime.MinValue;
 
     public TimeOfDayChanger(RuntimeHookEngine engine)
     {
         _engine = engine;
-        _timer = new Timer(Tick, null, 250, 250);
+        _timer = new Timer(Tick, null, 150, 150);
     }
 
     public bool Enabled => _enabled;
@@ -65,14 +93,9 @@ public sealed class TimeOfDayChanger : IDisposable
             var tod = FindObject(out error);
             if (tod == 0) return false;
             _heldSeconds = Clamp(seconds);
-            if (!_enabled)
-            {
-                _savedStopped = ReadByte(tod + OffStopped);
-                _savedLocked = ReadByte(tod + OffLocked);
-            }
+            if (!Hold(tod, out var how, out error)) return false;
             _enabled = true;
-            Assert(tod);
-            _engine.LogPublic($"TimeOfDay: holding {Hours(_heldSeconds)} (object 0x{tod:X}, was stopped={_savedStopped} locked={_savedLocked})");
+            _engine.LogPublic($"TimeOfDay: holding {Hours(_heldSeconds)} (clock 0x{tod:X}, {how})");
             return true;
         }
     }
@@ -87,13 +110,13 @@ public sealed class TimeOfDayChanger : IDisposable
             _heldSeconds = Clamp(seconds);
             var tod = FindObject(out error);
             if (tod == 0) return false;
-            Assert(tod);
+            if (!Hold(tod, out _, out error)) return false;
             _engine.LogPublic($"TimeOfDay: now holding {Hours(_heldSeconds)}");
             return true;
         }
     }
 
-    /// <summary>Lets the clock run again, restoring the game's own stopped/locked flags.</summary>
+    /// <summary>Gives the clock back to the game.</summary>
     public bool Disable(out string? error)
     {
         error = null;
@@ -102,18 +125,12 @@ public sealed class TimeOfDayChanger : IDisposable
             if (!_enabled) return true;
             _enabled = false;
             if (!_engine.IsAttached) return true;
-            var tod = FindObject(out _);
-            if (tod != 0 && _savedStopped != 0xFF)
+            try
             {
-                try
-                {
-                    _engine.WriteBytesPublic(tod + OffStopped, [_savedStopped]);
-                    _engine.WriteBytesPublic(tod + OffLocked, [_savedLocked]);
-                    _engine.LogPublic($"TimeOfDay: released (stopped={_savedStopped} locked={_savedLocked} restored)");
-                }
-                catch (Exception ex) { error = ex.Message; }
+                Release();
+                _engine.LogPublic("TimeOfDay: released, clock follows the game's schedule again");
             }
-            _savedStopped = _savedLocked = 0xFF;
+            catch (Exception ex) { error = ex.Message; }
             return error is null;
         }
     }
@@ -122,14 +139,99 @@ public sealed class TimeOfDayChanger : IDisposable
     {
         lock (_lock)
         {
-            _resolved = false; _global = 0; _off1 = _off2 = _off3 = 0;
-            _enabled = false; _lastObject = 0; _savedStopped = _savedLocked = 0xFF; _warned = false;
+            _resolved = false; _global = _wmGlobal = 0; _off1 = _off2 = _off3 = 0;
+            _enabled = false; _pausedPlayer = _heldObject = 0; _savedPause = _savedStopped = 0xFF; _warned = false;
         }
     }
 
     public void Dispose() => _timer.Dispose();
 
     // ------------------------------------------------------------------------------------
+    // Hold / release
+
+    private bool Hold(ulong tod, out string how, out string? error)
+    {
+        error = null;
+        how = "";
+        var wm = _engine.ReadUInt64Public(_wmGlobal);
+        var player = FindTimeline(wm);
+        if (player != 0)
+        {
+            var allow = ReadByte(wm + (ulong)_offAllow);
+            if (allow != 1)
+            {
+                // The game itself refuses to pause here, and a paused timeline in this state gets
+                // torn down for good — never touch the pause byte.
+                error = "Time of Day can't be held right now: the game's weather schedule doesn't allow pausing in this mode. Try again in normal free roam.";
+                _engine.LogPublic($"TimeOfDay: refusing — weather manager pause-allowed byte is {allow}");
+                return false;
+            }
+            if (_pausedPlayer != player) { _pausedPlayer = player; _savedPause = ReadByte(player); }
+            if (_savedPause > 1) _savedPause = 0;
+            _engine.WriteBytesPublic(player, [1]);   // exactly what the game's own pause does
+            how = $"weather timeline 0x{player:X} paused";
+        }
+        else
+        {
+            // No timeline driving time (e.g. an event owns it): Update's own advance is the only
+            // per-frame writer, and "stopped" turns that off.
+            if (_heldObject != tod || _savedStopped == 0xFF) _savedStopped = ReadByte(tod + OffStopped);
+            _engine.WriteBytesPublic(tod + OffStopped, [1]);
+            how = "no weather timeline active, clock stopped directly";
+        }
+        _heldObject = tod;
+        var bits = BitConverter.GetBytes(_heldSeconds);
+        _engine.WriteBytesPublic(tod + OffTransition, [0]);
+        _engine.WriteBytesPublic(tod + OffSpeedFlag, [0]);
+        _engine.WriteBytesPublic(tod + OffTime, bits);
+        _engine.WriteBytesPublic(tod + OffPrevTime, bits);   // no one-off "time jumped" lighting reset
+        return true;
+    }
+
+    private void Release()
+    {
+        if (_pausedPlayer != 0)
+        {
+            var wm = _engine.ReadUInt64Public(_wmGlobal);
+            if (FindTimeline(wm) == _pausedPlayer)
+                _engine.WriteBytesPublic(_pausedPlayer, [_savedPause == 1 ? (byte)1 : (byte)0]);
+        }
+        if (_heldObject != 0 && _savedStopped != 0xFF && IsPtr(_heldObject))
+            _engine.WriteBytesPublic(_heldObject + OffStopped, [_savedStopped == 1 ? (byte)1 : (byte)0]);
+        _pausedPlayer = 0; _savedPause = 0xFF; _heldObject = 0; _savedStopped = 0xFF;
+    }
+
+    private void Tick(object? state)
+    {
+        if (!_enabled || Interlocked.Exchange(ref _busy, 1) == 1) return;
+        try
+        {
+            lock (_lock)
+            {
+                if (!_enabled || !_engine.IsAttached || !_resolved) return;
+                var tod = FindObject(out _);
+                if (tod == 0) return;
+                var wm = _engine.ReadUInt64Public(_wmGlobal);
+                var player = FindTimeline(wm);
+                var paused = player == 0 || ReadByte(player) == 1;
+                var cur = ReadFloat(tod + OffTime);
+                if (paused && player == _pausedPlayer && tod == _heldObject && Math.Abs(cur - _heldSeconds) < 0.01f) return;
+                // The game resumed the timeline, reloaded the world, or something else set the time.
+                if ((DateTime.UtcNow - _lastLogUtc).TotalSeconds >= 5)
+                {
+                    _engine.LogPublic($"TimeOfDay: re-applying hold (time={cur:0.0}, paused={paused}, sameTimeline={player == _pausedPlayer}, sameClock={tod == _heldObject})");
+                    _lastLogUtc = DateTime.UtcNow;
+                }
+                if (player != _pausedPlayer) { _pausedPlayer = 0; _savedPause = 0xFF; }
+                Hold(tod, out _, out _);
+            }
+        }
+        catch (Exception ex) { if (!_warned) { _warned = true; _engine.LogPublic($"TimeOfDay: {ex.Message}"); } }
+        finally { Interlocked.Exchange(ref _busy, 0); }
+    }
+
+    // ------------------------------------------------------------------------------------
+    // Resolution
 
     private bool Resolve(out string? error)
     {
@@ -138,60 +240,70 @@ public sealed class TimeOfDayChanger : IDisposable
         var module = _engine.ReadModuleBytesPublic();
         if (module.Length == 0) { error = "Could not read the game module."; return false; }
         var mb = _engine.MainBase;
-
-        var pat = Pattern.Parse(SigChain);
-        int match = -1, count = 0;
-        foreach (var off in Pattern.FindAll(module, pat, 4)) { count++; if (match < 0) match = off; }
-        if (count != 1)
-        {
-            error = count == 0 ? "Time of Day: clock accessor chain not found in this game build — needs an update for this version."
-                               : $"Time of Day: clock accessor chain matched {count} sites — refusing to guess.";
-            _engine.LogPublic(error);
-            return false;
-        }
-
         ulong Rip(int dispOff) => (ulong)((long)mb + dispOff + 4 + BitConverter.ToInt32(module, dispOff));
-        var global = Rip(match + ChainGlobalDisp);
-        var fnWorld = Rip(match + ChainCallGetWorld);
-        var fnTod = Rip(match + ChainCallGetTod);
-        if (!_engine.IsInModule(global) || !_engine.IsInModule(fnWorld) || !_engine.IsInModule(fnTod))
+
+        int Unique(string sig, string what)
         {
-            error = "Time of Day: accessor chain points outside the module — refusing."; _engine.LogPublic(error); return false;
+            var pat = Pattern.Parse(sig);
+            int m = -1, c = 0;
+            foreach (var off in Pattern.FindAll(module, pat, 4)) { c++; if (m < 0) m = off; }
+            if (c == 1) return m;
+            _engine.LogPublic(c == 0 ? $"Time of Day: {what} not found in this game build." : $"Time of Day: {what} matched {c} sites — refusing to guess.");
+            return -1;
         }
 
-        // GetWorld: mov rcx,[rcx+off1] ; test rcx,rcx ; jne <fn2> ; xor eax,eax ; ret   with fn2: mov rax,[rcx+off2] ; ret
+        // --- the clock object chain
+        var chain = Unique(SigChain, "clock accessor chain");
+        if (chain < 0) { error = "Time of Day: clock accessor chain not found in this game build — needs an update for this version."; return false; }
+        var global = Rip(chain + ChainGlobalDisp);
+        var fnWorld = Rip(chain + ChainCallGetWorld);
+        var fnTod = Rip(chain + ChainCallGetTod);
+        if (!_engine.IsInModule(global) || !_engine.IsInModule(fnWorld) || !_engine.IsInModule(fnTod))
+        { error = "Time of Day: accessor chain points outside the module — refusing."; _engine.LogPublic(error); return false; }
         var w = (int)(fnWorld - mb);
         if (!(module[w] == 0x48 && module[w + 1] == 0x8B && module[w + 2] == 0x89 && module[w + 7] == 0x48 && module[w + 8] == 0x85 && module[w + 9] == 0xC9
               && module[w + 10] == 0x0F && module[w + 11] == 0x85))
-        {
-            error = "Time of Day: GetWorld has an unexpected shape — refusing."; _engine.LogPublic(error); return false;
-        }
+        { error = "Time of Day: GetWorld has an unexpected shape — refusing."; _engine.LogPublic(error); return false; }
         var off1 = BitConverter.ToInt32(module, w + 3);
         var fn2 = Rip(w + 12);
         var f2 = (int)(fn2 - mb);
         if (!_engine.IsInModule(fn2) || !(module[f2] == 0x48 && module[f2 + 1] == 0x8B && module[f2 + 2] == 0x81 && module[f2 + 7] == 0xC3))
-        {
-            error = "Time of Day: world accessor has an unexpected shape — refusing."; _engine.LogPublic(error); return false;
-        }
+        { error = "Time of Day: world accessor has an unexpected shape — refusing."; _engine.LogPublic(error); return false; }
         var off2 = BitConverter.ToInt32(module, f2 + 3);
-        // GetTimeOfDay: mov rax,[rcx+off3] ; ret
         var t = (int)(fnTod - mb);
         if (!(module[t] == 0x48 && module[t + 1] == 0x8B && module[t + 2] == 0x81 && module[t + 7] == 0xC3))
-        {
-            error = "Time of Day: GetTimeOfDay has an unexpected shape — refusing."; _engine.LogPublic(error); return false;
-        }
+        { error = "Time of Day: GetTimeOfDay has an unexpected shape — refusing."; _engine.LogPublic(error); return false; }
         var off3 = BitConverter.ToInt32(module, t + 3);
         if (off1 is <= 0 or > 0x4000 || off2 is <= 0 or > 0x4000 || off3 is <= 0 or > 0x4000)
+        { error = "Time of Day: accessor offsets out of range — refusing."; _engine.LogPublic(error); return false; }
+
+        // --- the weather timeline that overwrites the clock every frame, and the game's pause for it
+        var mode = Unique(SigScriptMode, "weather-timeline mode check");
+        var pause = Unique(SigPause, "weather-timeline pause");
+        if (mode < 0 || pause < 0)
+        { error = "Time of Day: the weather-timeline code was not found in this game build — needs an update for this version."; return false; }
+        var wmGlobal = Rip(mode + ModeGlobalDisp);
+        var offMode = BitConverter.ToInt32(module, mode + ModeModeOff);
+        var offPlayer = BitConverter.ToInt32(module, mode + ModePlayerOff);
+        var offPlayer2 = BitConverter.ToInt32(module, pause + PausePlayerOff);
+        var offAllow = BitConverter.ToInt32(module, pause + PauseAllowOff);
+        if (!_engine.IsInModule(wmGlobal) || offPlayer != offPlayer2 || offMode is <= 0 or > 0x2000 || offPlayer is <= 0 or > 0x2000
+            || offAllow is <= 0 or > 0x2000)
         {
-            error = "Time of Day: accessor offsets out of range — refusing."; _engine.LogPublic(error); return false;
+            error = $"Time of Day: weather-timeline offsets do not line up (mode 0x{offMode:X}, player 0x{offPlayer:X}/0x{offPlayer2:X}, allow 0x{offAllow:X}) — refusing.";
+            _engine.LogPublic(error);
+            return false;
         }
 
-        _global = global; _off1 = off1; _off2 = off2; _off3 = off3; _resolved = true;
-        _engine.LogPublic($"TimeOfDay: resolved chain [0x{global:X}] -> +0x{off1:X} -> +0x{off2:X} -> +0x{off3:X}");
+        _global = global; _off1 = off1; _off2 = off2; _off3 = off3;
+        _wmGlobal = wmGlobal; _offMode = offMode; _offPlayer = offPlayer; _offAllow = offAllow;
+        _resolved = true;
+        _engine.LogPublic($"TimeOfDay: resolved clock [0x{global:X}] -> +0x{off1:X} -> +0x{off2:X} -> +0x{off3:X}; " +
+                          $"weather [0x{wmGlobal:X}] mode +0x{offMode:X}, timeline +0x{offPlayer:X}, pause-allowed +0x{offAllow:X}");
         return true;
     }
 
-    /// <summary>Walks the pointer chain and validates the object; 0 (with error) when not available.</summary>
+    /// <summary>Walks the pointer chain and validates the clock object; 0 (with error) when not available.</summary>
     private ulong FindObject(out string? error)
     {
         error = null;
@@ -210,42 +322,18 @@ public sealed class TimeOfDayChanger : IDisposable
             error = "Time of Day: clock object layout does not match this game build.";
             return 0;
         }
-        if (tod != _lastObject)
-        {
-            if (_lastObject != 0 && _enabled)
-            {
-                // World was re-created (track swap): the saved flags belong to the old object.
-                _savedStopped = stopped; _savedLocked = locked;
-            }
-            _lastObject = tod;
-        }
         return tod;
     }
 
-    private void Assert(ulong tod)
+    /// <summary>The weather timeline currently driving the clock, or 0 when none is.</summary>
+    private ulong FindTimeline(ulong wm)
     {
-        _engine.WriteBytesPublic(tod + OffStopped, [1]);
-        _engine.WriteBytesPublic(tod + OffLocked, [1]);
-        _engine.WriteBytesPublic(tod + OffTime, BitConverter.GetBytes(_heldSeconds));
-    }
-
-    private void Tick(object? state)
-    {
-        if (!_enabled || Interlocked.Exchange(ref _busy, 1) == 1) return;
-        try
-        {
-            lock (_lock)
-            {
-                if (!_enabled || !_engine.IsAttached || !_resolved) return;
-                var tod = FindObject(out _);
-                if (tod == 0) return;
-                var cur = ReadFloat(tod + OffTime);
-                if (ReadByte(tod + OffStopped) != 1 || ReadByte(tod + OffLocked) != 1 || Math.Abs(cur - _heldSeconds) > 2f)
-                    Assert(tod);
-            }
-        }
-        catch (Exception ex) { if (!_warned) { _warned = true; _engine.LogPublic($"TimeOfDay: {ex.Message}"); } }
-        finally { Interlocked.Exchange(ref _busy, 0); }
+        if (!IsPtr(wm)) return 0;
+        if (_engine.ReadInt32Public(wm + (ulong)_offMode) != 1) return 0;
+        var player = _engine.ReadUInt64Public(wm + (ulong)_offPlayer);
+        if (!IsPtr(player)) return 0;
+        if (!IsPtr(_engine.ReadUInt64Public(player + OffTimelineKeys))) return 0;
+        return player;
     }
 
     private static bool IsPtr(ulong v) => v >= 0x10000 && v <= 0x0000_7FFF_FFFF_FFFF;
